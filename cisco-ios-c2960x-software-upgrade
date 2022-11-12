@@ -186,7 +186,7 @@
     - name: Check image version
       ios_facts:
 
-    - name: Assert that the version is correct
+    - name: Assert that the new version has been installed correctly.
       assert:
         that:
           - upgrade_ios_version == ansible_net_version
