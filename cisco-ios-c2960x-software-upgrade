@@ -1,0 +1,195 @@
+---
+### This playbook automates the software upgrade process for C2960X switch
+
+## Global parameters
+- hosts: cisco_ios
+  gather_facts: no
+
+  vars:
+## Change these as required.
+    - upgrade_model_version: WS-C2960X
+    - upgrade_ios_version: 15.2(7)E6
+    - upgrade_ios_file: c2960x-universalk9-mz.152-7.E6.bin
+    - upgrade_ios_file_hash: 2adb9ecfefb635ef7814c8d48e3f3a4a
+
+  tasks:
+    - name: Gather all legacy facts
+      ios_facts:
+        gather_subset: hardware
+
+## Check that switch model is correct
+    - name: Assert that the switch model is correct
+      assert:
+        that:
+          - "upgrade_model_version in ansible_net_model"
+        fail_msg: "Upgrade model doesn't match the playbook variable."
+        success_msg: "Upgrade model matches the playbook. Continue"
+
+## Check current version
+    - debug:
+        msg:
+        - "Current image is {{ ansible_net_version }}"
+        - "Upgrade image is {{ upgrade_ios_version }}"
+
+    - assert:
+        that:
+          - "ansible_net_version not in upgrade_ios_version"
+        fail_msg: "Current image matches the upgrade image."
+        success_msg: "Current image is not compliant and will be upgraded. Continue"
+
+## Check if the switch has enough memory in flash:
+    - name: Assert that there is enough space in flash for new image
+      assert:
+        that:
+          - ansible_net_filesystems_info ['flash:']['spacefree_kb'] > 32768
+        fail_msg: "There is not enough space left on the switch flash. Requires manual intervention"
+        success_msg: "Flash has enough space for the new image. Continue"
+
+## Check if new IOS file already exists on the switch flash
+    - name: Check flash
+      ios_command:
+        commands: 'show flash: | include {{ upgrade_ios_file }}'
+      register: dir_flash
+
+    - debug:
+        msg:
+        - "New IOS file doesn't exist in flash, continue with file transfer"
+      when: upgrade_ios_file not in dir_flash.stdout[0]
+
+    - debug:
+        msg:
+        - "New IOS file already exists in flash, skip copy image and continue with verification"
+      when: upgrade_ios_file in dir_flash.stdout[0]
+
+## Configure lines session and exec-timeout to 60min for file transfer.
+    - name: Configure session and exec-timeout to 60min for file transfer
+      ios_config:
+        lines:
+          - exec-timeout 60
+          - session-timeout 60
+        parents: line vty 0 15
+      when:
+        - upgrade_ios_file not in dir_flash.stdout[0]
+
+## Copy new software image to switch flash
+    - name: Copy image
+      net_put:
+        src: "/etc/ansible/images/{{ upgrade_ios_file }}"
+        dest: "flash:/{{ upgrade_ios_file }}"
+      vars:
+        ansible_command_timeout: 7200
+      when:
+        - upgrade_ios_file not in dir_flash.stdout[0]
+
+## Verify MD5 Hash
+    - name: Check MD5 Hash
+      ios_command:
+         commands:
+           - command: "verify /md5 flash:/{{ upgrade_ios_file }}"
+         wait_for:
+         - result[0] contains "{{ upgrade_ios_file_hash }}"
+      vars:
+        ansible_command_timeout: 120
+      when:
+        - upgrade_ios_file in dir_flash.stdout[0]
+
+## Change the boot variable to the new image
+    - name: Change boot variable to new image
+      ios_config:
+        commands:
+        - "boot system switch all flash:/{{ upgrade_ios_file }}"
+
+## Save the running config to flash
+    - name: Save running config
+      ios_config:
+        save_when: always
+
+## Create a folder for switch backups
+    - name: Create directory with hostname to backups folder
+      file:
+        path: /etc/ansible/backups/{{ inventory_hostname }}
+        state: directory
+      ignore_errors: yes
+
+## Backup Running Config
+    - name: Run show running-config
+      ios_command:
+        commands: show run
+      register: config
+
+    - name: Save output to backups folder
+      copy:
+        content: "{{config.stdout[0]}}"
+        dest: "/etc/ansible/backups/{{ inventory_hostname }}/configuration.txt"
+
+## Backup Interface status
+    - name: Run show interface status
+      ios_command:
+        commands: show interface status
+      register: interface_status
+
+    - name: Save output to backups folder
+      copy:
+        content: "{{interface_status.stdout[0]}}"
+        dest: "/etc/ansible/backups/{{ inventory_hostname }}/showinterfacestatus.txt"
+
+## Backup MAC-address table
+    - name: Run show mac-address table
+      ios_command:
+        commands: show mac address-table
+      register: mac_table
+
+    - name: Save output to backups folder
+      copy:
+        content: "{{mac_table.stdout[0]}}"
+        dest: "/etc/ansible/backups/{{ inventory_hostname }}/showmacaddresstable.txt"
+
+## Backup CDP neighbors
+    - name: Run show cdp neighbors
+      ios_command:
+        commands: show cdp neighbors
+      register: cdp_nei
+
+    - name: Save output to backups folder
+      copy:
+        content: "{{cdp_nei.stdout[0]}}"
+        dest: "/etc/ansible/backups/{{ inventory_hostname }}/showcdpnei.txt"
+
+## Backup Spanning-tree bridge
+    - name: Run show spanning-tree bridge
+      ios_command:
+        commands: show spanning-tree bridge
+      register: spanning_tree_bridge
+
+    - name: Save output to backups folder
+      copy:
+        content: "{{spanning_tree_bridge.stdout[0]}}"
+        dest: "/etc/ansible/backups/{{ inventory_hostname }}/showspanningtreebridge.txt"
+
+## Reload the switch
+    - name: Reload the switch
+      cli_command:
+        command: reload
+        prompt:
+          - confirm
+        answer:
+          - 'y'
+
+## Wait for reachability to the switch
+    - name: Wait for switch to come back online
+      wait_for:
+        host: "{{ inventory_hostname }}"
+        delay: 300
+      delegate_to: localhost
+
+## Check current image
+    - name: Check image version
+      ios_facts:
+
+    - name: Assert that the version is correct
+      assert:
+        that:
+          - upgrade_ios_version == ansible_net_version
+    - debug:
+        msg:
+        - "Software Upgrade has been completed"
